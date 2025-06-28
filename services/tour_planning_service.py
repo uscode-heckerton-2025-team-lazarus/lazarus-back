@@ -9,7 +9,7 @@ import math
 import re
 import json
 from .location_filter_service import LocationFilterService
-
+from .recommendation_service import RecommendationService
 # .env 파일 로드
 load_dotenv()
 
@@ -25,6 +25,7 @@ class TourPlanningService:
         
         # 장소 필터링 서비스 초기화
         self.location_filter = LocationFilterService()
+        self.recommendation_service = RecommendationService()
 
     def calculate_distance(self, lat1: float, lng1: float, lat2: float, lng2: float) -> float:
         """
@@ -130,11 +131,19 @@ class TourPlanningService:
         
         # 장소 제외 요청 찾기
         exclude_patterns = [
-            r'(.+?)\s*(안가고싶|제외|빼|안가|가지않|싫)',  # "비인 향교는 안가고싶은데 제외해줘"
+            r'(.+?)\s*(안가고|제외|빼고|빼줘|빼|안가|가지않|싫)',  # "비인 향교는 안가고싶은데 제외해줘"
             r'(.+?)\s*(제외해|빼줘|안가도|가지말)',
             r'(.+?)\s*(는|은)\s*(안가|제외|빼)',
         ]
-        
+        # ➊ “A 대신 B” 패턴 (교체)
+        replace_patterns = [
+            r'(.+?)\s*(?:대신|말고)\s*(.+?)\s*(?:가고싶어|갈래|가고)?'
+        ]
+        # ➋ “B 추가” 패턴
+        add_patterns = [
+            r'(.+?)\s*(?:추가해줘|추가|포함|가고싶어|갈래|가고)$'
+        ]
+
         for pattern in exclude_patterns:
             matches = re.findall(pattern, text_lower)
             for match in matches:
@@ -145,6 +154,27 @@ class TourPlanningService:
                     time_adjustment["exclude_locations"].append(location_name)
                     time_adjustment["has_request"] = True
         
+        # “A 대신 B” → A 제외 + B 추가
+        for pattern in replace_patterns:
+            m = re.search(pattern, text_lower)
+            if m:
+                # time_adj["exclude_locations"].append(m.group(1).strip())
+                time_adjustment["exclude_locations"].append(m.group(1).strip())
+                # time_adj["add_locations"].append(m.group(2).strip())
+                time_adjustment["add_locations"].append(m.group(2).strip())
+                # time_adj["has_request"] = True
+                time_adjustment["has_request"] = True
+
+
+        for pattern in add_patterns:
+            m = re.search(pattern, text_lower)
+            if m:
+                # time_adj["add_locations"].append(m.group(1).strip())
+                time_adjustment["add_locations"].append(m.group(1).strip())
+                time_adjustment["has_request"] = True
+                # --- ➌ “n일차 HH시 스케줄을 XXX로 수정” 패턴
+
+
         # 시간 패턴 찾기 (더 포괄적으로)
         time_patterns = [
             r'(\d{1,2})시\s*(이후|후|부터)',  # "2시 이후", "14시 후", "2시부터"
@@ -210,6 +240,24 @@ class TourPlanningService:
                 
                 break
         
+        m = re.search(
+            r'(\d+)일차\s*(\d{1,2})(?::(\d{2}))?시.*?(?:스케줄|일정).*?(\S+?)으로\s*(?:수정|바꿔)',
+            text_lower
+        )
+        if m:
+            day    = int(m.group(1))
+            hour   = int(m.group(2))
+            minute = int(m.group(3)) if m.group(3) else 0
+            new_loc = m.group(4).strip()
+            time_adjustment.update({
+                "has_request": True,
+                "type": "modify_specific",
+                "apply_to": "specific_activity",
+                "day": day,
+                "time": f"{hour:02d}:{minute:02d}",
+                "new_location": new_loc
+            })
+
         return time_adjustment
 
     def apply_time_adjustment(self, itinerary: List[Dict[str, Any]], adjustment: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -218,7 +266,28 @@ class TourPlanningService:
         """
         if not adjustment["has_request"]:
             return itinerary
-        
+        # ➊ 특정 액티비티만 수정해야 할 때
+        if adjustment.get("type") == "modify_specific":
+            new_itin = []
+            for day_plan in itinerary:
+                if day_plan["day"] != adjustment["day"]:
+                    new_itin.append(day_plan)
+                    continue
+                # 해당 일차
+                modified = {"day": day_plan["day"], "activities": []}
+                for act in day_plan["activities"]:
+                    if act["time"] == adjustment["time"]:
+                        # 시간 일치하면 장소 교체
+                        new_act = act.copy()
+                        new_act["location"] = adjustment["new_location"]
+                        new_act["description"] = f"{adjustment['new_location']} 방문"
+                        modified["activities"].append(new_act)
+                    else:
+                        modified["activities"].append(act)
+                new_itin.append(modified)
+            return new_itin
+
+
         adjusted_itinerary = []
         
         for day in itinerary:
@@ -329,16 +398,40 @@ class TourPlanningService:
         time_adjustment = self.extract_time_adjustment_request(text)
         
         # 제외할 장소가 있으면 필터링
-        filtered_locations = locations
-        if time_adjustment.get("exclude_locations"):
-            filtered_locations = self.location_filter.filter_locations_by_exclusion(
+        #filtered_locations = locations
+        # ➌ exclude 처리
+        if time_adjustment["exclude_locations"]:
+            locs = self.location_filter.filter_locations_by_exclusion(
                 locations, time_adjustment["exclude_locations"]
             )
-            print(f"장소 필터링 완료: {time_adjustment['exclude_locations']} 제외")
+        else:
+            locs = locations
+        
+        filtered_locations = locs
+        location_groups = self.group_locations_by_distance(filtered_locations, 2)
+
+        # ➍ add 처리 (간단히 카테고리 검색 후 삽입)
+        # for want in time_adjustment["add_locations"]:
+        #     found = self.recommendation_service.search_by_keyword(want, 1)
+        #     if found:
+        #         # 예: catMap[found[0].category] 에 추가
+        #         cat = found[0].category
+        #         locs.setdefault(cat, []).append(found[0])
+        
+        # filtered_locations = locs
+
+        # if time_adjustment.get("exclude_locations"):
+        #     filtered_locations = self.location_filter.filter_locations_by_exclusion(
+        #         locations, time_adjustment["exclude_locations"]
+        #     )
+        #     print(f"장소 필터링 완료: {time_adjustment['exclude_locations']} 제외")
         
         # 위치들을 거리 기준으로 그룹화
+        # location_groups = self.group_locations_by_distance(filtered_locations, 2)
         location_groups = self.group_locations_by_distance(filtered_locations, 2)
         
+        
+
         # 일수에 맞게 그룹 조정
         if len(location_groups) > size:
             location_groups = location_groups[:size]
